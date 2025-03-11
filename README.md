@@ -37,20 +37,10 @@ Nghiên cứu cho thấy mô hình ETICA-LSTM:
 pip install -r requirements.txt
 ```
 
-## Cách sử dụng
+## Chạy chương trình
 
-```python
-# Import thư viện
-from etica_lstm import ETICA_LSTM_Model
-
-# Khởi tạo mô hình
-model = ETICA_LSTM_Model()
-
-# Huấn luyện mô hình
-model.fit(X_train, y_train, epochs=100, batch_size=32)
-
-# Dự đoán
-predictions = model.predict(X_test)
+```bash
+python ./main.py
 ```
 
 ## Yêu cầu hệ thống
