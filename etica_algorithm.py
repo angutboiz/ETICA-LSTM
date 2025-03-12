@@ -12,23 +12,23 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 def calculate_etica_components(df, price_column, window_size=5, debug=False):
     """
-    Tính toán các thành phần ETICA đầy đủ với phương pháp tự tương quan
+    Tính toán các thành phần ETICA đầy đủ theo công thức đã cho
     
     Tham số:
     - df: DataFrame chứa dữ liệu giá cổ phiếu
     - price_column: Tên cột chứa giá cổ phiếu
-    - window_size: Kích thước cửa sổ cho tính toán tự tương quan
+    - window_size: Kích thước cửa sổ (không còn được sử dụng trong phương pháp mới)
     - debug: Bật chế độ gỡ lỗi với biểu đồ và log chi tiết
     
     Trả về:
     - DataFrame với các cột p_ext, p_int đã tính toán
     """
-    logging.info("Bắt đầu tính toán thành phần ETICA...")
+    logging.info("Bắt đầu tính toán thành phần ETICA theo công thức mới...")
     
     # Tạo một bản sao của DataFrame
     result = df.copy()
     
-    # Tính phần trăm thay đổi giá
+    # Tính phần trăm thay đổi giá theo công thức (1): p_i(t) = (P_i(t) - P_i(t-1)) / P_i(t-1) × 100
     pct_change_col = f'{price_column}_pct'
     if pct_change_col not in result.columns:
         result[pct_change_col] = result[price_column].pct_change() * 100
@@ -37,66 +37,27 @@ def calculate_etica_components(df, price_column, window_size=5, debug=False):
     # Lấy dữ liệu phần trăm thay đổi
     p_t = result[pct_change_col].values
     
-    # Tính toán hàm tự tương quan
-    logging.info(f"Đang tính toán tự tương quan với window_size={window_size}")
-    try:
-        # Tính hàm tự tương quan cho độ trễ đến window_size
-        r_k = acf(p_t, nlags=window_size, fft=False)
-        
-        # Kiểm tra nếu có giá trị NaN
-        if np.isnan(r_k).any():
-            logging.error("Hàm tự tương quan chứa giá trị NaN. Sử dụng phương pháp thay thế.")
-            # Phương pháp thay thế: tính tự tương quan thủ công
-            r_k = np.array([np.corrcoef(p_t[:-i], p_t[i:])[0, 1] if i > 0 else 1.0 
-                          for i in range(window_size + 1)])
-    except Exception as e:
-        logging.error(f"Lỗi khi tính tự tương quan: {str(e)}. Sử dụng phương pháp thay thế.")
-        # Phương pháp thay thế
-        r_k = np.array([np.corrcoef(p_t[:-i], p_t[i:])[0, 1] if i > 0 else 1.0 
-                      for i in range(window_size + 1)])
+    # Tính toán hệ số a theo công thức (4): a = sum(p_i(t)) / sum(sum(p_i(t)))
+    # Để tính sum(sum(p_i(t))), chúng ta sẽ tạo ma trận tích lũy
+    cumsum_p_t = np.cumsum(p_t)
+    sum_p_t = np.sum(p_t)
+    sum_cumsum_p_t = np.sum(cumsum_p_t)
     
-    # Debug: Hiển thị biểu đồ tự tương quan
-    if debug:
-        plt.figure(figsize=(10, 5))
-        plt.stem(range(len(r_k)), r_k)
-        plt.title('Hàm tự tương quan')
-        plt.xlabel('Độ trễ')
-        plt.ylabel('Tự tương quan')
-        plt.axhline(y=0, linestyle='--', color='gray')
-        plt.grid(True)
-        plt.savefig('images/autocorrelation.png')
-        plt.close()
-        
-        logging.info(f"Giá trị tự tương quan: {r_k}")
+    # Tránh chia cho 0
+    if abs(sum_cumsum_p_t) < 1e-10:
+        a = 0.5  # Giá trị mặc định
+        logging.warning("Mẫu số gần bằng 0 khi tính hệ số a. Sử dụng giá trị mặc định 0.5")
+    else:
+        a = sum_p_t / sum_cumsum_p_t
     
-    # Khởi tạo mảng cho thành phần bên ngoài và bên trong
-    p_ext = np.zeros_like(p_t)
-    p_int = np.zeros_like(p_t)
+    logging.info(f"Hệ số a = {a}")
     
-    # Tính toán thành phần bên ngoài và bên trong
-    logging.info("Đang tính toán thành phần bên ngoài và bên trong...")
+    # Tính toán thành phần bên ngoài theo công thức (3): p_ext(t) = a * sum(p_i(t))
+    # Sử dụng cumsum để tính tổng tích lũy
+    p_ext = a * cumsum_p_t
     
-    # Đảm bảo r_k[0] không bằng không để tránh chia cho 0
-    if abs(r_k[0]) < 1e-10:
-        r_k[0] = 1.0
-        logging.warning("Giá trị tự tương quan đầu tiên gần bằng không. Đặt bằng 1.0 để tránh lỗi chia cho 0.")
-    
-    # Tính hệ số βe và βi
-    beta_e = r_k[1] / r_k[0]
-    beta_i = 1 - beta_e
-    
-    logging.info(f"Hệ số beta: beta_e={beta_e}, beta_i={beta_i}")
-    
-    # Nếu beta vượt ra ngoài [0,1], sử dụng giá trị mặc định
-    if not (0 <= beta_e <= 1) or not (0 <= beta_i <= 1):
-        logging.warning(f"Hệ số beta không hợp lệ: beta_e={beta_e}, beta_i={beta_i}. Sử dụng giá trị mặc định.")
-        beta_e = 0.5
-        beta_i = 0.5
-    
-    # Tính p_ext và p_int theo công thức ETICA
-    for t in range(1, len(p_t)):
-        p_ext[t] = beta_e * p_t[t-1] + beta_e * p_ext[t-1] if t > 1 else beta_e * p_t[t-1]
-        p_int[t] = p_t[t] - p_ext[t]
+    # Tính toán thành phần bên trong theo công thức (5)
+    p_int = p_t - p_ext
     
     # Thêm thành phần vào DataFrame
     result['p_ext'] = p_ext
@@ -138,6 +99,7 @@ def calculate_etica_components(df, price_column, window_size=5, debug=False):
 def calculate_ex_in_components(df, price_column):
     """
     Chuyển đổi các thành phần p_ext và p_int thành các thành phần ex_t và in_t
+    theo công thức (31) và (32)
     
     Tham số:
     - df: DataFrame chứa các cột p_ext và p_int
@@ -161,17 +123,21 @@ def calculate_ex_in_components(df, price_column):
     # Tạo cột P_prev - giá tại thời điểm trước
     result['P_prev'] = result[price_column].shift(1)
     
-    # Áp dụng công thức chuyển đổi đúng:
-    # ex_t = P_prev * p_ext / 100
-    # in_t = P_prev * p_int / 100
-    result['ex_t'] = result['P_prev'] * result['p_ext'] / 100
-    result['in_t'] = result['P_prev'] * result['p_int'] / 100
+    # Loại bỏ các hàng có NaN sau khi shift
+    result = result.dropna(subset=['P_prev'])
     
-    # Kiểm tra tính đúng đắn: P(t) ≈ P(t-1) + ex_t + in_t
-    expected_price = result['P_prev'] + result['ex_t'] + result['in_t']
-    result['price_error'] = result[price_column] - expected_price
+    # Áp dụng công thức chuyển đổi theo công thức (31) và (32):
+    # in_t = (p_int(t) / 100 × P_i(t-1)) + P_i(t-1) / 2
+    # ex_t = (p_ext(t) / 100 × P_i(t-1)) + P_i(t-1) / 2
+    result['in_t'] = (result['p_int'] / 100 * result['P_prev']) + (result['P_prev'] / 2)
+    result['ex_t'] = (result['p_ext'] / 100 * result['P_prev']) + (result['P_prev'] / 2)
     
-    logging.info(f"Sai số trung bình khi kiểm tra: {np.mean(np.abs(result['price_error'].dropna()))}")
+    # Kiểm tra và xử lý các giá trị NaN hoặc vô cùng
+    for col in ['in_t', 'ex_t']:
+        # Thay thế các giá trị vô cùng bằng NaN
+        result[col] = result[col].replace([np.inf, -np.inf], np.nan)
+        # Điền các giá trị NaN bằng phương pháp nội suy
+        result[col] = result[col].interpolate(method='linear').fillna(method='bfill').fillna(method='ffill')
     
     logging.info("Hoàn thành chuyển đổi thành phần tỷ lệ phần trăm sang thành phần tuyệt đối.")
     return result
@@ -238,4 +204,3 @@ def visualize_etica_components(df, price_column='Lần cuối', start_idx=None, 
         plt.savefig(save_path)
         logging.info(f"Đã lưu biểu đồ tại {save_path}")
     
-    plt.show()

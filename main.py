@@ -6,7 +6,10 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.callbacks import ModelCheckpoint
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.mixed_precision import set_global_policy
+import tensorflow as tf
 from math import sqrt
 import warnings
 import os
@@ -14,6 +17,23 @@ import threading
 import time
 from etica_algorithm import calculate_etica_components, calculate_ex_in_components
 warnings.filterwarnings('ignore')
+
+# Kiểm tra và cấu hình GPU nếu có
+def setup_gpu():
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        try:
+            # Đặt cấu hình để TensorFlow chỉ sử dụng bộ nhớ cần thiết
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            print(f"Đã phát hiện và cấu hình {len(gpus)} GPU")
+            # Bật mixed precision để tăng tốc (chỉ hỗ trợ trên GPU hiện đại)
+            set_global_policy('mixed_float16')
+            print("Đã bật mixed precision training (float16)")
+        except RuntimeError as e:
+            print(f"Lỗi cấu hình GPU: {e}")
+    else:
+        print("Không phát hiện GPU, sẽ sử dụng CPU")
 
 # Bước 1: Đọc dữ liệu và điền giá trị null
 def load_and_preprocess_data(file_path):
@@ -77,18 +97,16 @@ def normalize_data(df, columns_to_normalize):
         scaler_dict[column] = scaler
     return df_normalized, scaler_dict
 
-# Bước 7: Chuẩn bị dữ liệu đầu vào cho LSTM (tạo chuỗi time-series)
+# Tối ưu hóa quá trình tạo sequences để tăng tốc độ
 def create_sequences(df, target_column, feature_columns, seq_length=60):
-    X, y = [], []
-    for i in range(len(df) - seq_length):
-        # Tạo chuỗi đầu vào X sử dụng các đặc trưng
-        features_seq = df[feature_columns].iloc[i:i+seq_length].values
-        X.append(features_seq)
-        
-        # Giá trị mục tiêu y (giá tại thời điểm tiếp theo)
-        y.append(df[target_column].iloc[i+seq_length])
+    data = df[feature_columns].values
+    target = df[target_column].values
     
-    return np.array(X), np.array(y)
+    # Sử dụng numpy operations để tăng tốc
+    X = np.array([data[i:i+seq_length] for i in range(len(data) - seq_length)])
+    y = target[seq_length:]
+    
+    return X, y
 
 # Bước 7: Chia dữ liệu thành tập huấn luyện và tập kiểm tra
 def split_data(X, y, train_ratio=0.6):
@@ -98,7 +116,7 @@ def split_data(X, y, train_ratio=0.6):
     return X_train, X_test, y_train, y_test
 
 # Bước 8: Xây dựng và huấn luyện mô hình LSTM
-def build_and_train_lstm_model(X_train, y_train, X_test, y_test, epochs=200, batch_size=32, model_path='model.h5'):
+def build_and_train_lstm_model(X_train, y_train, X_test, y_test, epochs=200, batch_size=64, model_path='model.h5'):
     # Lấy kích thước đầu vào
     input_shape = (X_train.shape[1], X_train.shape[2])
     
@@ -110,20 +128,47 @@ def build_and_train_lstm_model(X_train, y_train, X_test, y_test, epochs=200, bat
     model.add(Dropout(0.2))
     model.add(Dense(units=1))
     
-    # Biên dịch mô hình
-    model.compile(optimizer='adam', loss='mean_squared_error')
+    # Biên dịch mô hình với optimizer được tùy chỉnh
+    optimizer = Adam(learning_rate=0.001)
+    model.compile(optimizer=optimizer, loss='mean_squared_error')
     
     # Tạo checkpoint để lưu mô hình tốt nhất
-    checkpoint = ModelCheckpoint(model_path, monitor='val_loss', save_best_only=True, mode='min', verbose=1)
+    checkpoint = ModelCheckpoint(
+        model_path, 
+        monitor='val_loss', 
+        save_best_only=True, 
+        mode='min', 
+        verbose=0  # Giảm verbose để tăng tốc
+    )
     
-    # Huấn luyện mô hình
+    # Thêm early stopping để dừng khi mô hình không cải thiện
+    early_stopping = EarlyStopping(
+        monitor='val_loss',
+        patience=20,  # số epochs không cải thiện trước khi dừng
+        restore_best_weights=True,
+        verbose=1
+    )
+    
+    # Thêm giảm learning rate khi plateau
+    reduce_lr = ReduceLROnPlateau(
+        monitor='val_loss',
+        factor=0.5,
+        patience=10,
+        min_lr=0.00001,
+        verbose=1
+    )
+    
+    # Huấn luyện mô hình với bộ callbacks cải tiến
     history = model.fit(
         X_train, y_train,
         epochs=epochs,
-        batch_size=batch_size,
+        batch_size=batch_size,  # tăng batch_size để tận dụng GPU tốt hơn
         validation_data=(X_test, y_test),
-        callbacks=[checkpoint],
-        verbose=1
+        callbacks=[checkpoint, early_stopping, reduce_lr],
+        verbose=1,
+        shuffle=True,  # đảm bảo xáo trộn dữ liệu
+        use_multiprocessing=True,  # sử dụng đa luồng
+        workers=4  # số workers cho đa luồng
     )
     
     return model, history
@@ -276,7 +321,6 @@ def compare_models(models_results):
     
     plt.tight_layout()
     plt.savefig('images/model_comparison.png')
-    plt.show()
     
     # Vẽ biểu đồ dự đoán của các mô hình
     plt.figure(figsize=(12, 6))
@@ -284,9 +328,36 @@ def compare_models(models_results):
     # Giới hạn số lượng điểm dữ liệu để biểu đồ dễ đọc hơn
     last_points = 100
     
+    # Màu sắc để phân biệt các mô hình
+    colors = {'ETICA-LSTM': ('blue', 'cyan'), 
+              'Traditional LSTM': ('red', 'orange'),
+              'EMD-LSTM': ('green', 'lightgreen'),
+              'CEEMDAN-LSTM': ('purple', 'magenta')}
+    
     for model_name, results in models_results.items():
-        plt.plot(results['actual'][-last_points:], label=f'Actual ({model_name})')
-        plt.plot(results['predicted'][-last_points:], label=f'Predicted ({model_name})', linestyle='--')
+        # Đảm bảo dữ liệu là mảng numpy 1 chiều
+        if results['actual'] is not None and results['predicted'] is not None:
+            actual = np.array(results['actual']).flatten()
+            predicted = np.array(results['predicted']).flatten()
+            
+            # Lấy chỉ các điểm dữ liệu cuối cùng
+            if len(actual) > last_points:
+                actual = actual[-last_points:]
+            if len(predicted) > last_points:
+                predicted = predicted[-last_points:]
+            
+            # Đảm bảo không có giá trị NaN
+            actual_mask = ~np.isnan(actual)
+            predicted_mask = ~np.isnan(predicted)
+            
+            # Vẽ dữ liệu nếu có đủ điểm
+            if np.sum(actual_mask) > 0:
+                color_actual, color_pred = colors.get(model_name, ('black', 'gray'))
+                plt.plot(actual[actual_mask], label=f'Actual ({model_name})', color=color_actual)
+            if np.sum(predicted_mask) > 0:
+                color_actual, color_pred = colors.get(model_name, ('black', 'gray'))
+                plt.plot(predicted[predicted_mask], label=f'Predicted ({model_name})', 
+                         linestyle='--', color=color_pred)
     
     plt.title('Model Predictions Comparison')
     plt.xlabel('Time')
@@ -294,7 +365,6 @@ def compare_models(models_results):
     plt.legend()
     plt.grid(True)
     plt.savefig('images/prediction_comparison.png')
-    plt.show()
     
     return df_comparison
 
@@ -318,7 +388,10 @@ def build_ceemdan_lstm_model(df, price_column='Lần cuối'):
     }
 
 # Hàm chính để chạy toàn bộ workflow
-def run_etica_lstm_workflow(file_path, price_column='Lần cuối', seq_length=60, train_ratio=0.6, epochs=200, batch_size=32):
+def run_etica_lstm_workflow(file_path, price_column='Lần cuối', seq_length=60, train_ratio=0.6, epochs=200, batch_size=64):
+    # Cấu hình GPU nếu có
+    setup_gpu()
+    
     # Tạo thư mục để lưu mô hình nếu chưa tồn tại
     model_dir = "saved_models"
     os.makedirs(model_dir, exist_ok=True)
@@ -419,7 +492,6 @@ def run_etica_lstm_workflow(file_path, price_column='Lần cuối', seq_length=6
     plt.xlabel('Time')
     plt.ylabel('Price')
     plt.legend()
-    plt.show()
     
     # Bước 11: So sánh với các mô hình khác
     print("\nBước 11: So sánh ETICA-LSTM với các mô hình khác...")
@@ -474,12 +546,12 @@ if __name__ == "__main__":
     # Đường dẫn đến file dữ liệu cổ phiếu
     file_path = "Dữ liệu Lịch sử VN 30.csv"
     
-    # Chạy workflow
+    # Chạy workflow với batch size tăng lên
     results = run_etica_lstm_workflow(
         file_path=file_path,
         price_column='Lần cuối',  # Cột giá đóng cửa
         seq_length=60,         # Độ dài chuỗi (60 ngày)
         train_ratio=0.6,       # Tỷ lệ chia tập huấn luyện (60%)
         epochs=200,            # Số epochs
-        batch_size=32          # Kích thước batch
+        batch_size=64          # Tăng kích thước batch để tận dụng GPU tốt hơn
     )
